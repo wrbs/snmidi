@@ -22,7 +22,8 @@ Timing accurate to about ~1ms, network and OS scheduler dependent (it does use
 
 ## Usage
 
-    cargo run --release -- [--debug] [--bind 0.0.0.0] [--port 4836]
+    cargo install --git https://github.com/wrbs/snmidi.git
+    snmidi [--debug] [--bind 0.0.0.0] [--port 4836]
 
 Debug shows logs of every midi message sent.
 
@@ -147,7 +148,7 @@ Split out
     0003     # len=3
     903C7F   # note on
     0064     # delta time = 100ms
-    0006     # len=5
+    0005     # len=5
     903C00   # note on (vel=0 = off)
     3E7F     # next note on (using running status)
     0064     # another 100ms
