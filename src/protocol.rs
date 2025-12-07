@@ -43,8 +43,15 @@ pub struct ShutdownRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "notification")]
-pub enum Notification {
-    Ack { seq: u32 },
-    Error { error: String },
+#[serde(rename_all = "snake_case")]
+pub struct Ack {
+    pub ack: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ErrorResponse {
+    pub error: String,
+    pub details: String,
+    pub ansi: String,
 }

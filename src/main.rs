@@ -27,8 +27,8 @@ use crate::{
     data_packet::{Packet, QueuedMessage},
     message_queue::MessageQueue,
     protocol::{
-        ConnectRequest, ConnectResponse, InitializeRequest, InitializeResponse,
-        Notification, Port, PortId, ShutdownRequest,
+        Ack, ConnectRequest, ConnectResponse, ErrorResponse, InitializeRequest,
+        InitializeResponse, Port, PortId, ShutdownRequest,
     },
 };
 
@@ -299,7 +299,7 @@ async fn handle_client_result(
                         },
                     }
 
-                    write_json(write_, &Notification::Ack { seq: seqnum }).await?;
+                    write_json(write_, &Ack { ack: seqnum }).await?;
                 },
             }
         }
@@ -318,8 +318,10 @@ async fn handle_client(stream: TcpStream, client_addr: SocketAddr, bind: IpAddr)
         Ok(()) => (),
         Err(error) => {
             error!(?error, "Client errored");
-            let _ = write_json(&mut write_, &Notification::Error {
+            let _ = write_json(&mut write_, &ErrorResponse {
                 error: error.to_string(),
+                details: format!("{:#?}", error),
+                ansi: format!("{:?}", error),
             })
             .await;
         },

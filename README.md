@@ -57,12 +57,16 @@ Every error is handled the same way (either in response to a command or
 asynchronously). The server sends a final notification with
 the error message and shuts everything down.
 
-    < {"notification":"error","error":"expected value at line 1 column 1"}
+    < {"error":"expected value at line 1 column 1"}
 
 If established, the connection is closed after sending a 'panic' note off CC
 (`controller=123`) to every channel.
 
 Feel free to reconnect.
+
+(Well actually you get back `ansi` and `details` fields too, but that feels like
+more of a rust implementation detail/not part of the 'protocol': feel free to
+just ignore them and make them optional in any client libraries if you do)
 
 ### Shutdown
 
@@ -93,9 +97,9 @@ testing to disable the seqnum validation (example below)
 The server sends acks over tcp after every message. Make sure to actually read
 them or eventually the server send buffer will fill up and it'll block.
 
-    < {"notification":"ack","seq":0}
-    < {"notification":"ack","seq":1}
-    < {"notification":"ack","seq":2}
+    < {"ack":0}
+    < {"ack":1}
+    < {"ack":2}
 
 ### Instant/Reset
 
