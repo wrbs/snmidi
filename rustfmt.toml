@@ -1,0 +1,21 @@
+# Went down the list picking stuff I liked
+
+unstable_features = true
+blank_lines_upper_bound = 1
+fn_single_line = false
+format_code_in_doc_comments = true
+format_macro_matchers = true
+format_macro_bodies = true
+format_strings = true
+hex_literal_case = "Upper"
+match_block_trailing_comma = true
+max_width = 88
+newline_style = "Unix"
+imports_granularity = "Crate"
+normalize_comments = true
+normalize_doc_attributes = true
+overflow_delimited_expr = true
+reorder_impl_items = true
+group_imports = "StdExternalCrate"
+use_field_init_shorthand = true
+wrap_comments = true
