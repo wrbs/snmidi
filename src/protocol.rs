@@ -1,3 +1,4 @@
+use color_eyre::eyre::Error;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,9 +38,9 @@ pub struct ConnectResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct ShutdownRequest {
-    pub shutdown_stop_all: bool,
+#[serde(rename_all = "snake_case", tag = "command")]
+pub enum EstablishedCommand {
+    ShutdownWithoutStop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +53,21 @@ pub struct Ack {
 #[serde(rename_all = "snake_case")]
 pub struct ErrorResponse {
     pub error: String,
-    pub details: String,
+    pub context: Vec<String>,
     pub ansi: String,
+}
+
+impl ErrorResponse {
+    pub fn of_report(report: &Error) -> Self {
+        let mut context = vec![];
+        for entry in report.chain().skip(1) {
+            context.push(entry.to_string());
+        }
+
+        Self {
+            error: report.to_string(),
+            context,
+            ansi: format!("{:?}", report),
+        }
+    }
 }

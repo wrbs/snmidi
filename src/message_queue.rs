@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
-use midly::stream::MidiStream;
+use midly::live::LiveEvent;
+use tracing::debug;
 
 #[derive(Debug)]
 struct Entry {
@@ -16,24 +17,26 @@ pub enum PopResult<'a> {
 }
 
 #[derive(Debug)]
-struct MessageQueueWithoutStream {
+pub struct MessageQueue {
     data: VecDeque<u8>,
     entries: VecDeque<Entry>,
     queue_end_timestamp: u64,
     data_to_pop: usize,
+    buffer: Vec<u8>,
 }
 
-impl MessageQueueWithoutStream {
-    fn new() -> Self {
+impl MessageQueue {
+    pub fn new() -> Self {
         Self {
             data: VecDeque::new(),
             entries: VecDeque::new(),
             queue_end_timestamp: 0,
             data_to_pop: 0,
+            buffer: Vec::new(),
         }
     }
 
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.data.clear();
         self.entries.clear();
         self.queue_end_timestamp = 0;
@@ -48,23 +51,24 @@ impl MessageQueueWithoutStream {
         self.data_to_pop = 0;
     }
 
-    fn advance_end(&mut self, delta: u64) {
+    pub fn add_delta_time(&mut self, delta: u64) {
+        debug!(?delta, "add delta time");
         self.clear_used_data();
         self.queue_end_timestamp += delta;
     }
 
-    fn enqueue(&mut self, data: &[u8]) {
+    pub fn enqueue(&mut self, message: &LiveEvent) {
         self.clear_used_data();
-        if data.len() > 0 {
-            self.data.extend(data);
-            self.entries.push_back(Entry {
-                timestamp: self.queue_end_timestamp,
-                size: data.len(),
-            });
-        }
+        self.buffer.clear();
+        message.write(&mut self.buffer).unwrap();
+        self.data.extend(self.buffer.as_slice());
+        self.entries.push_back(Entry {
+            timestamp: self.queue_end_timestamp,
+            size: self.buffer.len(),
+        });
     }
 
-    fn pop<'a>(&'a mut self, cur_timestamp: u64) -> PopResult<'a> {
+    pub fn pop<'a>(&'a mut self, cur_timestamp: u64) -> PopResult<'a> {
         self.clear_used_data();
         match self.entries.front() {
             None => PopResult::Empty,
@@ -89,43 +93,5 @@ impl MessageQueueWithoutStream {
                 }
             },
         }
-    }
-}
-
-pub struct MessageQueue {
-    inner: MessageQueueWithoutStream,
-    stream: MidiStream,
-    buffer: Vec<u8>,
-}
-
-impl MessageQueue {
-    pub fn new() -> Self {
-        Self {
-            inner: MessageQueueWithoutStream::new(),
-            stream: MidiStream::new(),
-            buffer: Vec::new(),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-
-    pub fn add(&mut self, delta_time: u64, messages: &[u8]) {
-        self.inner.advance_end(delta_time);
-        self.stream.feed(messages, |msg| {
-            self.buffer.clear();
-            msg.write(&mut self.buffer).unwrap();
-            self.inner.enqueue(&self.buffer);
-        });
-        self.stream.flush(|msg| {
-            self.buffer.clear();
-            msg.write(&mut self.buffer).unwrap();
-            self.inner.enqueue(&self.buffer);
-        });
-    }
-
-    pub fn pop(&mut self, cur_timestamp: u64) -> PopResult<'_> {
-        self.inner.pop(cur_timestamp)
     }
 }

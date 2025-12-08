@@ -20,19 +20,26 @@ connections for less strictly realtime things like sequencers.
 Timing accurate to about ~1ms, network and OS scheduler dependent (it does use
 `timeBeginPeriod` of `1ms` on Windows).
 
+Only sending midi from client->server is supported for now. May extend in the
+future.
+
 ## Usage
 
-    cargo install --git https://github.com/wrbs/snmidi.git
+    cargo install --git https://github.com/wrbs/snmidi
     snmidi [--debug] [--bind 0.0.0.0] [--port 4836]
 
 Debug shows logs of every midi message sent.
 
 ## Protocol
 
-You connect over tcp, choose the port to connect to and then it tells you where
-to send midi over udp.
+Clients connect over tcp (default 4836), choose the midi port to connect to from
+the ones the host driver presents and then send udp packets with either
 
-You can have multiple connections at once.
+- raw midi messages (with a very small header)
+- 
+
+You can have multiple connections at once: each connection will have a different
+udp port the server tells you to use.
 
 ### initialization
 
@@ -65,20 +72,19 @@ If established, the connection is closed after sending a 'panic' note off CC
 
 Feel free to reconnect.
 
-(Well actually you get back `ansi` and `details` fields too, but that feels like
+(Well actually you get back `ansi` and `context` fields too, but that feels like
 more of a rust implementation detail/not part of the 'protocol': feel free to
 just ignore them and make them optional in any client libraries if you do)
 
 ### Shutdown
 
-To gracefully shutdown, send one of the final shutdown messages. The server will
-close the tcp session/udp socket/midi connection.
+At any point you can close the stream to shutdown. By default if the connection
+is established it will send a 'all notes off' midi message to every channel (CC
+123).
 
-    > { "shutdown_stop_all": false }
-    > { "shutdown_stop_all": true }
-
-`stop_all` will send a midi note off to everything if true (like happens on
-errors).
+To shutdown without stopping send `{"command": "shutdown_without_stop"}` as the
+message. That's the only command currently; if you want the stop just close the
+stream.
 
 ### udp header
 
@@ -124,17 +130,57 @@ Note reset does not reset the sequence number, only the queued messages.
 
 ### Queue
 
-Queue messages consist of events with a 4-byte header specifying delta time in
+You can queue messages to run in the future with the server handling the timing.
+This is useful if you already know what you want to play in the near future
+(sequencer/playing back a midi file) and want to smooth over potential wifi
+latency or jitter.  The minimum granularity is 1ms which nicely aligns with:
+
+- the minimum OS's reasonably provide for context switches
+- human perceptual limits
+- usual LAN ethernet latency
+- the time taken to send a single 3-byte 'note on' midi message over an actual
+  midi cable (at the standard 31.25 kbps it's 960 µs)
+
+Although this is the minimum timing granularity, relative ordering is preserved.
+
+The way this works is you can send 'queue' packets which are annotated with
+delta times (like midi files) which are always denoted in ms (unlike midi files,
+no quarter notes here).  The server will play these back in addition to any
+'instant' packets it receives according to these delta times.
+
+Each packet can have multiple messages. Delta time runs on between packets, and messages can have partial entries/you can end the packets mid way through specifying anything: the parser state is retained in between packets.
+
+Reset packets do reset the parser state and queue though.
+
+Queue entries consist of events with a 4-byte header specifying delta time in
 ms (first 2 bytes) and length of the messages (next 2). Multiple messages can be
-included with the same delta time.
+included within the same record, the server splits them up into individual
+messages when sending to the driver.
 
-Each packet can have multiple messages. Delta time runs on between packets.
+The time the first queue packet is received (or first sent after a reset)
+is defined as `t0`. Every timestamp is considered relative to this point. 
+This means the very first delta time specifies the delay before things will
+start playing -- set it some time in the future to have a chance to buffer
+things first.
 
-The first delta time sent (or first sent after a reset packet) specifies the
-offset when things will start playing -- set it some time in the future to
- have a chance to buffer things first.
+Specifically, at any point where the server is processing things it will look
+for any queued messages whose time is in the past (relative to current time -
+`t0`) and execute them. Then it will sleep until the next queued message's time
+or next UDP packet it receives, whichever is triggered first.
 
-Length can be zero if you have some need to send more than 65.535s of silence.
+If the server receives a queue request for an event that is in the past relative
+to the current time it will immediately execute.
+
+In addition to the timer's schedule (every ms at most if needed), the queue is
+checked after handling an instant packet. The messages in the instant packet
+will execute first.
+
+You can use running status within messages with the same header but not across
+different ones.  Whatever you do it gets normalized before it gets sent to the
+driver.
+
+Length can be zero (so you can just submit a delta time if you want to queue up
+more than 65.535s of silence for some reason).
 
 Example: two notes lasting 100ms one after the other
 
@@ -142,17 +188,25 @@ Example: two notes lasting 100ms one after the other
 
 Split out
 
-    'SNMq'     # magic number, type = q
+    'SNMq'   # magic number, type = q
     DEADBEEF # seqnum, this one is always considered 'valid'
-    0000     # delta time = 0ms (start executing sequence immedaitely)
+
+    0000     # delta time = 0ms (start executing sequence immediately)
     0003     # len=3
     903C7F   # note on
+
     0064     # delta time = 100ms
     0005     # len=5
-    903C00   # note on (vel=0 = off)
-    3E7F     # next note on (using running status)
-    0064     # another 100ms
-    0003     # len=3
-    803E00   # note off (this time using actual code)
+    903C00   # note off (note on with vel=0)
+    3E7F     # next note on (using running status of `90`)
 
-Run with `--debug` to get a debug log of every message
+    0064     # delta time = 100ms (200ms relative to start)
+    0003     # len=3
+    803E00   # note off (actual note off message this time)
+
+Run with `--debug` to get a debug log of every midi message sent.
+
+## Future ideas
+
+- gap filler/retransmission for dropped packets
+- receiving midi

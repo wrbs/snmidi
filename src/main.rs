@@ -1,4 +1,5 @@
 mod data_packet;
+mod json_lines;
 mod message_queue;
 mod protocol;
 
@@ -8,14 +9,8 @@ use clap::Parser;
 use color_eyre::eyre::{OptionExt, Result, bail};
 use midir::{MidiOutput, MidiOutputConnection, PortInfoError};
 use midly::{MidiMessage, live::LiveEvent, stream::MidiStream};
-use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{
-        self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-        ReadHalf, WriteHalf,
-    },
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::oneshot,
     task::JoinHandle,
     time::{Duration, Instant, Sleep, sleep_until},
 };
@@ -24,11 +19,12 @@ use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    data_packet::{Packet, QueuedMessage},
+    data_packet::{Packet, QueueParser},
+    json_lines::{JsonLines, ReadJson},
     message_queue::MessageQueue,
     protocol::{
-        Ack, ConnectRequest, ConnectResponse, ErrorResponse, InitializeRequest,
-        InitializeResponse, Port, PortId, ShutdownRequest,
+        Ack, ConnectRequest, ConnectResponse, ErrorResponse, EstablishedCommand,
+        InitializeRequest, InitializeResponse, Port, PortId,
     },
 };
 
@@ -45,27 +41,6 @@ struct Args {
     /// Show debug logs
     #[clap(long)]
     debug: bool,
-}
-
-async fn read_json<'a, 'b, T: Deserialize<'a> + 'a, S: AsyncBufRead + Unpin>(
-    stream: &'b mut S,
-    buf: &'a mut String,
-) -> Result<T> {
-    buf.clear();
-    stream.read_line(buf).await?;
-
-    let t = serde_json::from_str(buf)?;
-    Ok(t)
-}
-
-async fn write_json<S: AsyncWrite + Unpin, T: Serialize>(
-    stream: &mut S,
-    value: &T,
-) -> Result<()> {
-    let mut data = serde_json::to_string(value)?;
-    data.push('\n');
-    stream.write_all(data.as_bytes()).await?;
-    Ok(())
 }
 
 fn get_ports(output: &MidiOutput) -> Vec<Port> {
@@ -103,24 +78,27 @@ impl ConnectionWrapper {
         }
     }
 
+    #[instrument(skip(self))]
     fn send_queued_message_assume_valid(&mut self, raw_msg: &[u8]) -> Result<()> {
         if enabled!(Level::DEBUG) {
             self.buf.clear();
             let msg = LiveEvent::parse(raw_msg).expect("message already to be valid");
-            debug!(?msg, "Sending message {:02X?}", raw_msg);
+            debug!(?msg, "Sending queued message");
         }
         self.conn.send(raw_msg)?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn send_message(&mut self, msg: LiveEvent) -> Result<()> {
         self.buf.clear();
         msg.write(&mut self.buf).unwrap();
-        debug!(?msg, "Sending message {:02X?}", self.buf);
+        debug!("Sending message {:02X?}", self.buf);
         self.conn.send(&self.buf)?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn panic(&mut self) -> Result<()> {
         for ch in 0..16 {
             self.send_message(LiveEvent::Midi {
@@ -146,6 +124,7 @@ impl Drop for ConnectionWrapper {
     }
 }
 
+#[instrument]
 async fn optional_sleep(sleep: Option<Sleep>) -> Option<()> {
     match sleep {
         None => None,
@@ -156,19 +135,20 @@ async fn optional_sleep(sleep: Option<Sleep>) -> Option<()> {
     }
 }
 
+#[instrument(skip_all)]
 async fn handle_client_result(
-    mut read: BufReader<ReadHalf<TcpStream>>,
-    write_: &mut WriteHalf<TcpStream>,
+    json: &mut JsonLines<TcpStream>,
     bind: IpAddr,
 ) -> Result<()> {
     // TODO: this is all really messy, split into parts next time I touch
 
-    let mut buffer = String::new();
-
-    let InitializeRequest {
+    let Some(InitializeRequest {
         client_name,
         version,
-    } = read_json(&mut read, &mut buffer).await?;
+    }) = json.json_read_opt().await?
+    else {
+        return Ok(());
+    };
 
     if version != 0 {
         bail!("Unsupported version {} (client={:?})", version, client_name);
@@ -178,9 +158,11 @@ async fn handle_client_result(
     let output = MidiOutput::new(&client_name)?;
     let ports = get_ports(&output);
 
-    write_json(write_, &InitializeResponse { ports }).await?;
+    json.write(&InitializeResponse { ports }).await?;
 
-    let ConnectRequest { id } = read_json(&mut read, &mut buffer).await?;
+    let Some(ConnectRequest { id }) = json.json_read_opt().await? else {
+        return Ok(());
+    };
     let port = output
         .find_port_by_id(id.0)
         .ok_or_eyre("port id not found")?;
@@ -189,26 +171,18 @@ async fn handle_client_result(
     let udp_sock = UdpSocket::bind((bind, 0)).await?;
     let udp_port = udp_sock.local_addr()?.port();
     info!(client_name, udp_port, "connected");
-    write_json(write_, &ConnectResponse { udp_port }).await?;
+    json.write(&ConnectResponse { udp_port }).await?;
 
     let mut udp_buffer = vec![0; 1500];
     let mut expected_seqnum = 0;
     let mut queue = MessageQueue::new();
     let mut t0: Option<Instant> = None;
     let mut instant_stream = MidiStream::new();
+    let mut queue_parser = QueueParser::new();
 
     // The shutdown reader goes in a oneshot as it's not cancel safe
     // if we need more messages we probably want a more general channel here
     // dealing with tcp reading
-
-    let mut shutdown = {
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = read_json::<ShutdownRequest, _>(&mut read, &mut buffer).await;
-            let _ = tx.send(result);
-        });
-        rx
-    };
 
     loop {
         let sleep = if let Some(start_time) = t0 {
@@ -234,11 +208,15 @@ async fn handle_client_result(
         };
 
         let read_bytes = tokio::select! {
-            biased; // shutdown > incoming packets > timer
-            shutdown_result = &mut shutdown /* cancel safe: channel */ => {
-                let ShutdownRequest { shutdown_stop_all } = shutdown_result??;
-                connection.stop_all_on_exit = shutdown_stop_all;
-                break;
+            biased; // command > incoming packets > timer
+            command_result = json.json_read_opt() /* cancel safe: channel */ => {
+                match command_result? {
+                    Some(EstablishedCommand::ShutdownWithoutStop) => {
+                        connection.stop_all_on_exit = false;
+                        return Ok(());
+                    }
+                    None => return Ok(()),
+                }
             }
             read_result = udp_sock.recv(&mut udp_buffer[..]) /* cancel safe: documented */ => {
                 let read_bytes = read_result?;
@@ -255,6 +233,7 @@ async fn handle_client_result(
                     warn!(len, "Got invalid packet, skipping. start = {start:02X?}");
                 },
                 Some(Packet { seqnum, kind, data }) => {
+                    debug!(seqnum, ?kind, len = data.len(), "Received UDP packet");
                     if seqnum == expected_seqnum {
                         expected_seqnum += 1;
                     } else if seqnum == 0xDEADBEEF {
@@ -271,6 +250,7 @@ async fn handle_client_result(
                         data_packet::Kind::Instant { reset_queue } => {
                             if reset_queue {
                                 queue.reset();
+                                queue_parser.reset();
                                 t0 = None;
                                 instant_stream.flush(|_| {});
                             }
@@ -289,43 +269,31 @@ async fn handle_client_result(
                                 t0 = Some(Instant::now());
                             }
 
-                            for result in data_packet::read_queued_messages(data) {
-                                let QueuedMessage {
-                                    delta_time,
-                                    messages,
-                                } = result?;
-                                queue.add(delta_time as u64, messages);
-                            }
+                            queue_parser.feed(data, &mut queue);
                         },
                     }
 
-                    write_json(write_, &Ack { ack: seqnum }).await?;
+                    json.write(&Ack { ack: seqnum }).await?;
                 },
             }
         }
     }
-
-    Ok(())
 }
 
 #[instrument(skip(stream))]
 async fn handle_client(stream: TcpStream, client_addr: SocketAddr, bind: IpAddr) {
-    let (read, mut write_) = io::split(stream);
-    let read = BufReader::new(read);
+    let mut json = JsonLines::new(stream).await;
     info!("Client connected");
 
-    match handle_client_result(read, &mut write_, bind).await {
+    match handle_client_result(&mut json, bind).await {
         Ok(()) => (),
         Err(error) => {
-            error!(?error, "Client errored");
-            let _ = write_json(&mut write_, &ErrorResponse {
-                error: error.to_string(),
-                details: format!("{:#?}", error),
-                ansi: format!("{:?}", error),
-            })
-            .await;
+            error!(?error, "error while handling client");
+            let _ = json.write(&ErrorResponse::of_report(&error)).await;
         },
     }
+
+    let _ = json.join();
 
     info!("Finished handling client");
 }

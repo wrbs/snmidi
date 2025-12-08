@@ -1,4 +1,6 @@
-use color_eyre::eyre::{Result, eyre};
+use midly::stream::MidiStream;
+
+use crate::message_queue::MessageQueue;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Kind {
@@ -41,51 +43,55 @@ impl<'a> Packet<'a> {
     }
 }
 
-pub struct QueuedMessage<'a> {
-    pub delta_time: u16,
-    pub messages: &'a [u8],
+pub struct QueueParser {
+    stream: MidiStream,
+    header_bytes_read: u8,
+    delta: u16,
+    remaining: u16,
 }
 
-pub fn read_queued_messages(
-    mut data: &[u8],
-) -> impl Iterator<Item = Result<QueuedMessage<'_>>> {
-    std::iter::from_fn(move || {
-        if data.len() == 0 {
-            None
-        } else {
-            let cur = data;
-            let result = if cur.len() <= 4 {
-                Err(eyre!(
-                    "expected 0 or >= 4 bytes while reading queued message: \
-                     {data:02X?}"
-                ))
-            } else {
-                let (delta_bytes, cur) = cur.split_at(2);
-                let (length_bytes, cur) = cur.split_at(2);
-                let delta_time = u16::from_be_bytes(delta_bytes.try_into().unwrap());
-                let length = u16::from_be_bytes(length_bytes.try_into().unwrap());
-                match cur.split_at_checked(length as usize) {
-                    None => {
-                        let actual_length = cur.len();
-                        Err(eyre!(
-                            "not all length bytes included: delta={delta_time}, \
-                             length in packet={length}, \
-                             actual_remaining={actual_length}"
-                        ))
-                    },
-                    Some((messages, rest)) => {
-                        data = rest;
-                        Ok(QueuedMessage {
-                            delta_time,
-                            messages,
-                        })
-                    },
-                }
-            };
-            if result.is_err() {
-                data = &[];
-            }
-            Some(result)
+impl QueueParser {
+    pub fn new() -> Self {
+        Self {
+            stream: MidiStream::new(),
+            header_bytes_read: 0,
+            delta: 0,
+            remaining: 0,
         }
-    })
+    }
+
+    pub fn reset(&mut self) {
+        self.stream.flush(|_| {});
+        self.header_bytes_read = 0;
+    }
+
+    pub fn feed(&mut self, mut data: &[u8], queue: &mut MessageQueue) {
+        while !data.is_empty() {
+            if self.header_bytes_read < 4 {
+                let byte = *data.split_off_first().unwrap() as u16;
+
+                match self.header_bytes_read {
+                    0 => self.delta = byte << 8,
+                    1 => {
+                        self.delta |= byte;
+                        queue.add_delta_time(self.delta as u64);
+                    },
+                    2 => self.remaining = byte << 8,
+                    3 => self.remaining |= byte,
+                    _ => unreachable!(),
+                }
+
+                self.header_bytes_read += 1;
+            } else if self.remaining == 0 {
+                self.stream.flush(|event| queue.enqueue(&event));
+                self.header_bytes_read = 0;
+            } else {
+                let to_split = data.len().min(self.remaining as usize);
+                self.remaining -= to_split as u16;
+                let (cur, rest) = data.split_at(to_split);
+                data = rest;
+                self.stream.feed(cur, |event| queue.enqueue(&event));
+            }
+        }
+    }
 }
